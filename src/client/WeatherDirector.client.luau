@@ -34,7 +34,7 @@ local TimePresets = {
 local WeatherKeys = { "Clear", "Rain", "Storm", "Fog" }
 
 ----------[[ VARIABLES ]]----------
--- cached so im not findfirstchilding every frame
+-- cached so im not findfirstchild every frame
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui
 
