@@ -94,7 +94,7 @@ function WeatherState:Tick(Director, Dt)
 	end
 end
 
--- exit hook is here for future cleanup even though most modes rely on the next onenter overwriting values
+-- exit hok is here for future cleanup even though most modes rely on the next onenter overwriting values
 function WeatherState:Exit(Director)
 	if self.OnExit then
 		self.OnExit(Director)
