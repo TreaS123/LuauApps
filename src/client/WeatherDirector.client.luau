@@ -41,6 +41,7 @@ local PlayerGui
 local Atmosphere
 local ColorCorrection
 
+-- only one weather mode runs at a time, statetable holds the profile for each button name
 local ActiveState
 local StateTable = {}
 local TransitionBusy = false
@@ -58,17 +59,18 @@ local HeartbeatConn
 local StatusLabel
 local PanelFrame
 
--- one raycast params reused for lightning, ignore list gets refreshed each strike
+-- this stays reused so we do not allocate raycast params every lightning roll
+-- ignore list still gets rebuilt per strike because player/rain refs can change
 local CachedRayParams = RaycastParams.new()
 CachedRayParams.FilterType = Enum.RaycastFilterType.Exclude
 CachedRayParams.IgnoreWater = true
 
 ----------[[ WEATHER STATE METATABLE ]]----------
--- metatable setup for weather states
+-- tiny state object so each weather mode can plug enter/tick/exit without huge if chains
 local WeatherState = {}
 WeatherState.__index = WeatherState
 
--- each mode passes in its own onenter/ontick/onexit
+-- hooks are optional so a mode can stay simple if it only needs onenter for setup
 function WeatherState.New(Name, Hooks)
 	local Self = setmetatable({}, WeatherState)
 	Self.Name = Name
@@ -78,19 +80,21 @@ function WeatherState.New(Name, Hooks)
 	return Self
 end
 
--- director table gets passed in, storm uses it for laststrike
+-- director is passed through so states can write small shared runtime fields
 function WeatherState:Enter(Director)
 	if self.OnEnter then
 		self.OnEnter(Director)
 	end
 end
 
+-- tick only runs for modes that need per frame work like rain follow or lightning rolls
 function WeatherState:Tick(Director, Dt)
 	if self.OnTick then
 		self.OnTick(Director, Dt)
 	end
 end
 
+-- exit hook is here for future cleanup even though most modes rely on the next onenter overwriting values
 function WeatherState:Exit(Director)
 	if self.OnExit then
 		self.OnExit(Director)
@@ -98,6 +102,7 @@ function WeatherState:Exit(Director)
 end
 
 ----------[[ FUNCTIONS ]]----------
+-- rain and lightning both need a stable world position, root is the best fallback when camera isnt used
 local function GetCharacterRoot()
 	local Character = LocalPlayer.Character
 	if not Character then
@@ -106,7 +111,8 @@ local function GetCharacterRoot()
 	return Character:FindFirstChild("HumanoidRootPart")
 end
 
--- make atmosphere and colorcorrection if the place doesnt have them
+-- some places already configure lighting, some do not
+-- this keeps script startup safe in both cases
 local function EnsureLightingObjects()
 	Atmosphere = Lighting:FindFirstChildOfClass("Atmosphere")
 	if not Atmosphere then
@@ -121,19 +127,21 @@ local function EnsureLightingObjects()
 	end
 end
 
+-- lighting tweens keep sky/fog changes smooth instead of snapping when weather buttons get spammed
 local function TweenLighting(Props, Info)
 	local Tween = TweenService:Create(Lighting, Info or TweenShort, Props)
 	Tween:Play()
 	return Tween
 end
 
+-- atmosphere handles the hazy look separate from raw fog distance on lighting
 local function TweenAtmosphere(Props, Info)
 	local Tween = TweenService:Create(Atmosphere, Info or TweenShort, Props)
 	Tween:Play()
 	return Tween
 end
 
--- turn all rain emitters on/off together
+-- toggling every emitter in one place keeps weather transitions consistent
 local function SetRainEnabled(Enabled)
 	for _, Emitter in RainEmitters do
 		if Emitter.Parent then
@@ -142,6 +150,7 @@ local function SetRainEnabled(Enabled)
 	end
 end
 
+-- rate is split from enabled so storm can crank particles without re toggling emitters every frame
 local function SetRainRate(Rate)
 	for _, Emitter in RainEmitters do
 		if Emitter.Parent then
@@ -150,13 +159,15 @@ local function SetRainRate(Rate)
 	end
 end
 
+-- status line is optional at runtime but helps testers see active weather + time combo
 local function UpdateStatus(Text)
 	if StatusLabel then
 		StatusLabel.Text = Text
 	end
 end
 
--- 3 invisible parts with rain particles above the player
+-- each anchor carries one emitter
+-- multiple anchors make rain feel wider than one tiny point above the head
 local function BuildRainEmitters()
 	if RainFolder then
 		RainFolder:Destroy()
@@ -175,6 +186,7 @@ local function BuildRainEmitters()
 	}
 
 	for Index, Offset in Offsets do
+		-- invisible anchor so particles have a parent part we can move each tick
 		local Anchor = Instance.new("Part")
 		Anchor.Name = "RainAnchor" .. Index
 		Anchor.Anchored = true
@@ -188,6 +200,7 @@ local function BuildRainEmitters()
 		local Attachment = Instance.new("Attachment")
 		Attachment.Parent = Anchor
 
+		-- emitter values tuned for fast downward streaks, not fluffy cloud particles
 		local Emitter = Instance.new("ParticleEmitter")
 		Emitter.Name = "RainEmitter"
 		Emitter.Texture = "rbxasset://textures/particles/sparkles_main.dds"
@@ -211,7 +224,7 @@ local function BuildRainEmitters()
 	end
 end
 
--- keep rain centered on the player
+-- anchors follow the player root so rain appears local to camera/player zone
 local function FollowRainAnchors()
 	local Root = GetCharacterRoot()
 	if not Root or not RainFolder then
@@ -228,7 +241,7 @@ local function FollowRainAnchors()
 	end
 end
 
--- rescan wind tags every few sec, not every frame
+-- this refresh is periodic on purpose to avoid expensive tagged scans every heartbeat
 local function RefreshWindTargets()
 	table.clear(WindTargets)
 
@@ -239,7 +252,7 @@ local function RefreshWindTargets()
 	end
 end
 
--- push unanchored parts based on current wind
+-- we add velocity instead of teleporting so movement still feels physics based
 local function ApplyWind(Dt)
 	if WindStrength <= 0 then
 		return
@@ -254,6 +267,7 @@ local function ApplyWind(Dt)
 	end
 end
 
+-- we exclude temporary weather objects and character so strikes hit the world more naturally
 local function PickLightningIgnore()
 	local List = { RainFolder }
 
@@ -265,6 +279,7 @@ local function PickLightningIgnore()
 	CachedRayParams.FilterDescendantsInstances = List
 end
 
+-- strike point is randomized near player so storm feels nearby without always hitting the same spot
 local function StrikeLightning(Director)
 	PickLightningIgnore()
 
@@ -275,7 +290,7 @@ local function StrikeLightning(Director)
 	local Origin = Center + RandomOffset + Vector3.new(0, 220, 0)
 	local Direction = Vector3.new(0, -400, 0)
 
-	-- ray down from sky, flash wherever it hits
+	-- cast from sky to ground so the flash can align to real terrain normals
 	local Result = workspace:Raycast(Origin, Direction, CachedRayParams)
 	if not Result then
 		return
@@ -283,6 +298,7 @@ local function StrikeLightning(Director)
 
 	local HitCFrame = CFrame.new(Result.Position, Result.Position + Result.Normal)
 
+	-- tiny neon marker + point light gives a grounded strike even though bolt is fake client side
 	local Marker = Instance.new("Part")
 	Marker.Anchored = true
 	Marker.CanCollide = false
@@ -301,7 +317,7 @@ local function StrikeLightning(Director)
 	Flash.Color = Color3.fromRGB(220, 230, 255)
 	Flash.Parent = Marker
 
-	-- screen flash then delete the bolt part
+	-- short exposure punch sells the lightning without keeping screen blown out
 	ColorCorrection.Brightness = 0.35
 	ColorCorrection.Contrast = 0.15
 
@@ -319,7 +335,7 @@ local function StrikeLightning(Director)
 	Director.LastStrike = os.clock()
 end
 
--- few leaf parts on the baseplate so wind actually does something
+-- these are quick demo props so wind has visible impact in empty test places
 local function SpawnDemoWindParts()
 	if workspace:FindFirstChild("WeatherDemoBits") then
 		return
@@ -345,6 +361,7 @@ local function SpawnDemoWindParts()
 	print("spawned loose parts for wind")
 end
 
+-- shared button factory so weather/time rows stay visually consistent without copy paste ui code
 local function MakeUiButton(Parent, Text, Position, Size, Callback)
 	local Button = Instance.new("TextButton")
 	Button.Name = Text .. "Button"
@@ -367,10 +384,11 @@ local function MakeUiButton(Parent, Text, Position, Size, Callback)
 	return Button
 end
 
--- build the panel in code
+-- panel is built in code so this script can run standalone without prebuilt ui assets
 local function BuildPanel()
 	PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
+	-- destroy old panel on reload so studio hot reload doesnt stack duplicate guis
 	local Old = PlayerGui:FindFirstChild("WeatherPanel")
 	if Old then
 		Old:Destroy()
@@ -378,6 +396,7 @@ local function BuildPanel()
 
 	local Screen = Instance.new("ScreenGui")
 	Screen.Name = "WeatherPanel"
+	-- keep panel after respawn so testers dont lose controls mid session
 	Screen.ResetOnSpawn = false
 	Screen.Parent = PlayerGui
 
@@ -423,7 +442,7 @@ local function BuildPanel()
 	local ButtonWidth = 68
 	local Gap = 6
 
-	-- weather buttons
+	-- weather row switches active state immediately
 	for Index, Key in WeatherKeys do
 		local X = 10 + (Index - 1) * (ButtonWidth + Gap)
 		MakeUiButton(PanelFrame, Key, UDim2.new(0, X, 0, WeatherRowY), UDim2.new(0, ButtonWidth, 0, 28), function()
@@ -444,7 +463,7 @@ local function BuildPanel()
 
 	local TimeY = 112
 	local TimeWidth = 66
-	-- time buttons, clock only
+	-- time buttons only tween clock, they do not change rain/storm state
 	for Index, Name in { "Morning", "Noon", "Evening", "Night" } do
 		local X = 10 + (Index - 1) * (TimeWidth + Gap)
 		MakeUiButton(PanelFrame, Name, UDim2.new(0, X, 0, TimeY), UDim2.new(0, TimeWidth, 0, 24), function()
@@ -469,7 +488,7 @@ local function BuildPanel()
 	print("panel ready")
 end
 
--- time presets just tween clocktime
+-- time is independent from weather so users can mix storm morning, fog night, etc
 function WeatherDirector.SetTime(PresetName)
 	local Clock = TimePresets[PresetName]
 	if not Clock then
@@ -480,12 +499,13 @@ function WeatherDirector.SetTime(PresetName)
 	UpdateStatus((ActiveState and ActiveState.Name or "idle") .. " · " .. string.lower(PresetName))
 end
 
--- swap weather, run exit then enter
+-- transition guard prevents double switching when players spam click buttons
 function WeatherDirector.SetWeather(Name)
 	if TransitionBusy then
 		return
 	end
 
+	-- lookup by name keeps button wiring simple, actual behavior lives in statetable profiles
 	local NextState = StateTable[Name]
 	if not NextState then
 		warn("unknown weather:", Name)
@@ -498,6 +518,7 @@ function WeatherDirector.SetWeather(Name)
 
 	TransitionBusy = true
 
+	-- exit old state first so rain/wind/lighting dont fight during the handoff
 	if ActiveState then
 		ActiveState:Exit(WeatherDirector)
 	end
@@ -511,14 +532,16 @@ function WeatherDirector.SetWeather(Name)
 	print("weather is now", Name)
 end
 
--- all the weather modes
+-- weather profile values live here so tuning is centralized and easy to tweak
 local function RegisterStates()
 	StateTable.Clear = WeatherState.New("Clear", {
 		OnEnter = function()
+			-- clear is our visual reset point, so both wind and rain get fully zeroed
 			WindStrength = 0
 			SetRainEnabled(false)
 			SetRainRate(0)
 
+			-- very high fog end keeps distance open and bright in clear skies
 			TweenLighting({ Brightness = 2, FogEnd = 100000, FogStart = 0 }, TweenLong)
 			TweenAtmosphere({
 				Density = 0.3,
@@ -533,11 +556,13 @@ local function RegisterStates()
 	-- light rain
 	StateTable.Rain = WeatherState.New("Rain", {
 		OnEnter = function()
+			-- rain should feel active but still playable, so wind stays moderate
 			WindStrength = 4
 			WindDirection = Vector3.new(0.8, 0, 0.2).Unit
 			SetRainEnabled(true)
 			SetRainRate(140)
 
+			-- lower brightness and medium fog sell overcast weather without full storm darkness
 			TweenLighting({ Brightness = 1.2, FogEnd = 600, FogStart = 0 }, TweenLong)
 			TweenAtmosphere({
 				Density = 0.45,
@@ -548,6 +573,7 @@ local function RegisterStates()
 			}, TweenLong)
 		end,
 		OnTick = function(_, Dt)
+			-- keep rain centered above player while wind still affects tagged parts
 			FollowRainAnchors()
 			ApplyWind(Dt)
 		end,
@@ -556,12 +582,14 @@ local function RegisterStates()
 	-- heavy rain + lightning
 	StateTable.Storm = WeatherState.New("Storm", {
 		OnEnter = function(Director)
+			-- storm pushes hardest so debris movement is obvious and different from rain mode
 			WindStrength = 22
 			WindDirection = Vector3.new(1, 0, 0.35).Unit
 			SetRainEnabled(true)
 			SetRainRate(260)
 			ThunderTimer = 0
 
+			-- this is intentionally darker and shorter view distance than rain
 			TweenLighting({ Brightness = 0.7, FogEnd = 420, FogStart = 0 }, TweenLong)
 			TweenAtmosphere({
 				Density = 0.55,
@@ -571,12 +599,14 @@ local function RegisterStates()
 				Glare = 0,
 			}, TweenLong)
 
+			-- laststrike on director is a hook if we ever want cooldown logic between bolts
 			Director.LastStrike = 0
 		end,
 		OnTick = function(Director, Dt)
 			FollowRainAnchors()
 			ApplyWind(Dt)
 
+			-- randomized delay avoids robotic lightning cadence players can predict
 			ThunderTimer += Dt
 			if ThunderTimer > math.random(4, 9) then
 				ThunderTimer = 0
@@ -588,11 +618,13 @@ local function RegisterStates()
 	-- fog, no rain
 	StateTable.Fog = WeatherState.New("Fog", {
 		OnEnter = function()
+			-- fog still has a little air movement, just not enough for storm-like chaos
 			WindStrength = 2
 			WindDirection = Vector3.new(0.2, 0, 1).Unit
 			SetRainEnabled(false)
 			SetRainRate(0)
 
+			-- short fog end is the main effect here; atmosphere haze is intentionally high
 			TweenLighting({ Brightness = 1.4, FogEnd = 120, FogStart = 0 }, TweenLong)
 			TweenAtmosphere({
 				Density = 0.65,
@@ -603,12 +635,13 @@ local function RegisterStates()
 			}, TweenLong)
 		end,
 		OnTick = function(_, Dt)
+			-- fog has no rain follow work, only light drift on tagged props
 			ApplyWind(Dt)
 		end,
 	})
 end
 
--- heartbeat runs active state + wind rescan
+-- heartbeat drives active weather behavior and also does low frequency maintenance work
 local function OnHeartbeat(Dt)
 	if not ActiveState then
 		return
@@ -616,6 +649,7 @@ local function OnHeartbeat(Dt)
 
 	ActiveState:Tick(WeatherDirector, Dt)
 
+	-- wind target list only needs refresh when new tagged parts appear, not every frame
 	WindScanTimer += Dt
 	if WindScanTimer > 2 then
 		WindScanTimer = 0
@@ -623,7 +657,7 @@ local function OnHeartbeat(Dt)
 	end
 end
 
--- startup, lighting first then everything else
+-- startup order matters: create lighting objects first, then states, then ui/runtime loops
 function WeatherDirector.Start()
 	EnsureLightingObjects()
 	RegisterStates()
@@ -632,6 +666,7 @@ function WeatherDirector.Start()
 	SpawnDemoWindParts()
 	RefreshWindTargets()
 
+	-- single heartbeat connection runs whichever state is active instead of separate loops per mode
 	HeartbeatConn = RunService.Heartbeat:Connect(OnHeartbeat)
 
 	WeatherDirector.SetWeather("Clear")
